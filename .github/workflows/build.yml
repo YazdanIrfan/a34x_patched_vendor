@@ -74,36 +74,45 @@ jobs:
               exit 1
             fi
           done
-          
+
       - name: Extract Images
         run: |
           # 1. Extract AP tarball and aggressively delete the 7GB firmware zip
           unzip -q decrypted_firmware.zip "AP_*.tar.md5"
           rm decrypted_firmware.zip
           
-          # 2. Extract super.img.lz4 and aggressively delete the 7GB AP tarball
-          tar -xf AP_*.tar.md5 super.img.lz4
+          # 2. Extract super.img.lz4 AND modern boot/security partitions
+          # The "|| true" prevents the workflow from crashing if a file like vbmeta_vendor doesn't exist
+          tar -xf AP_*.tar.md5 super.img.lz4 init_boot.img.lz4 dtbo.img.lz4 vbmeta.img.lz4 vbmeta_system.img.lz4 vbmeta_vendor.img.lz4 || true
           rm AP_*.tar.md5
           
-          # 3. Decompress lz4 and aggressively delete the compressed archive
+          # 3. Decompress the massive super image
           lz4 -d super.img.lz4 super.img
           rm super.img.lz4
           
-          # 4. Convert sparse to raw using the C-binary (prevents Python RAM exhaustion)
+          # 4. Safely decompress any extra boot/security partitions that were found
+          for img in init_boot dtbo vbmeta vbmeta_system vbmeta_vendor; do
+            if [ -f "${img}.img.lz4" ]; then
+              lz4 -d "${img}.img.lz4" "${img}.img"
+              rm "${img}.img.lz4"
+            fi
+          done
+          
+          # 5. Convert sparse to raw using the C-binary
           if file super.img | grep -q "sparse"; then
             simg2img super.img super_raw.img
-            rm super.img # Delete the 10.7GB sparse image immediately
+            rm super.img 
           else
             mv super.img super_raw.img
           fi
           
-          # 5. Extract vendor, vendor_dlkm, and odm partitions from the raw super partition map
+          # 6. Extract vendor, vendor_dlkm, and odm partitions
           mkdir extracted_super
           python3 /usr/local/bin/lpunpack.py -p vendor super_raw.img extracted_super
           python3 /usr/local/bin/lpunpack.py -p vendor_dlkm super_raw.img extracted_super
           python3 /usr/local/bin/lpunpack.py -p odm super_raw.img extracted_super
           
-          # 6. Aggressively delete the 16GB raw super image to clear space for repackaging
+          # 7. Aggressively delete the raw super image
           rm super_raw.img
           
           # Handle vendor.img sparse formatting
@@ -160,29 +169,22 @@ jobs:
           sudo cp patches/tee/vendor/etc/init/tee_blobs.rc vendor_tree/etc/init/
 
           # --- CRITICAL: BIND-MOUNT PERMISSIONS & SELINUX ---
-          # For the bind-mount to succeed, the older binaries MUST be root-owned and executable
           sudo chown -R 0:0 vendor_tree/tee_*
           sudo chmod -R 755 vendor_tree/tee_*
           
-          # The init script that executes the bind-mount MUST strictly be 644
           sudo chown 0:0 vendor_tree/etc/init/tee_blobs.rc
           sudo chmod 644 vendor_tree/etc/init/tee_blobs.rc
 
-          # Apply standard vendor contexts to the hidden TEE binaries so they can be mounted
           sudo setfattr -R -n security.selinux -v "u:object_r:vendor_file:s0" vendor_tree/tee_* 2>/dev/null || true
-          
-          # Label the RC script so Android's init daemon is allowed to read it
           sudo setfattr -n security.selinux -v "u:object_r:vendor_configs_file:s0" vendor_tree/etc/init/tee_blobs.rc 2>/dev/null || true
           # --------------------------------------------------
 
-          # 6. Inject SELinux Bind-Mount Exceptions (DYNAMIC CHANGED HERE)
-          # This automatically reads the firmware target's actual SELinux tags to prevent compiler panics
+          # 6. Inject SELinux Bind-Mount Exceptions
           CIL_FILE="vendor_tree/etc/selinux/vendor_sepolicy.cil"
           if [ -f "$CIL_FILE" ] && ! sudo grep -q "tee_file (dir (mounton" "$CIL_FILE"; then
               INIT_TYPE=$(grep -oE '\(typeattributeset init_[a-zA-Z0-9_]*' "$CIL_FILE" | head -n 1 | awk '{print $2}')
               PRIV_TYPE=$(grep -oE '\(typeattributeset priv_app_[a-zA-Z0-9_]*' "$CIL_FILE" | head -n 1 | awk '{print $2}')
               
-              # Secure fallbacks if string patterns aren't matched
               [ -z "$INIT_TYPE" ] && INIT_TYPE="init"
               [ -z "$PRIV_TYPE" ] && PRIV_TYPE="priv_app"
 
@@ -224,5 +226,8 @@ jobs:
             vendor_patched.img
             vendor_dlkm.img
             odm.img
+            init_boot.img
+            dtbo.img
+            vbmeta*.img
           draft: false
           prerelease: false
