@@ -39,7 +39,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y python3-pip lz4 android-sdk-libsparse-utils erofs-utils p7zip-full
-          pip3 install --user samloader3
+          pip3 install --user git+https://github.com/nlscc/samloader.git
 
       - name: Install lpunpack
         run: |
@@ -50,14 +50,21 @@ jobs:
       - name: Retrieve and Decrypt Firmware
         run: |
           export PATH=$PATH:$HOME/.local/bin
-          # Handle cron triggers where inputs are not explicitly provided
           MODEL="${{ github.event.inputs.model || 'SM-A346E' }}"
           REGION="${{ github.event.inputs.region || 'INS' }}"
           
-          VERSION=$(samloader3 checkupdate $MODEL $REGION)
+          VERSION=$(samloader -m $MODEL -r $REGION checkupdate)
           echo "Firmware Version: $VERSION"
-          samloader3 download $MODEL $REGION $VERSION .
-          samloader3 decrypt $MODEL $REGION $VERSION *.enc4 *.zip
+          
+          # Download the encrypted firmware package
+          samloader -m $MODEL -r $REGION download -v $VERSION -O .
+          
+          # Identify the encrypted file and define the output zip name
+          ENC4_FILE=$(ls *.enc4 | head -n 1)
+          ZIP_FILE="${ENC4_FILE%.enc4}.zip"
+          
+          # Decrypt the firmware
+          samloader -m $MODEL -r $REGION decrypt -v $VERSION -i $ENC4_FILE -o $ZIP_FILE
 
       - name: Extract Images
         run: |
