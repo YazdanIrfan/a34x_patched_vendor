@@ -82,9 +82,11 @@ jobs:
             mv super.img super_raw.img
           fi
           
-          # 5. Extract ONLY the vendor partition (ignores the massive 6GB system partition)
+          # 5. Extract vendor, vendor_dlkm, and odm partitions from the raw super partition map
           mkdir extracted_super
           python3 /usr/local/bin/lpunpack.py -p vendor super_raw.img extracted_super
+          python3 /usr/local/bin/lpunpack.py -p vendor_dlkm super_raw.img extracted_super
+          python3 /usr/local/bin/lpunpack.py -p odm super_raw.img extracted_super
           
           # 6. Aggressively delete the 16GB raw super image to clear space for repackaging
           rm super_raw.img
@@ -94,6 +96,24 @@ jobs:
             simg2img extracted_super/vendor.img vendor_raw.img
           else
             mv extracted_super/vendor.img vendor_raw.img
+          fi
+
+          # Handle vendor_dlkm.img sparse formatting
+          if [ -f extracted_super/vendor_dlkm.img ]; then
+            if file extracted_super/vendor_dlkm.img | grep -q "sparse"; then
+              simg2img extracted_super/vendor_dlkm.img vendor_dlkm.img
+            else
+              mv extracted_super/vendor_dlkm.img vendor_dlkm.img
+            fi
+          fi
+
+          # Handle odm.img sparse formatting
+          if [ -f extracted_super/odm.img ]; then
+            if file extracted_super/odm.img | grep -q "sparse"; then
+              simg2img extracted_super/odm.img odm.img
+            else
+              mv extracted_super/odm.img odm.img
+            fi
           fi
 
       - name: Patch Vendor Filesystem (Multi-TEE Bind-Mount)
@@ -184,7 +204,10 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.release_tag }}
-          name: "Patched Vendor: ${{ env.release_tag }}"
-          files: vendor_patched.img
+          name: "Patched Vendor Pack: ${{ env.release_tag }}"
+          files: |
+            vendor_patched.img
+            vendor_dlkm.img
+            odm.img
           draft: false
           prerelease: false
