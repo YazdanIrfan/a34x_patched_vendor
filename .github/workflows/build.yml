@@ -105,36 +105,53 @@ jobs:
           sudo cp -a vendor_mount/. vendor_tree/
           sudo umount vendor_mount
 
-          # 2. Reset and Recreate TEE Mount Point (CRITICAL FIX)
+          # 2. Reset and Recreate TEE Mount Point
           sudo rm -rf vendor_tree/tee
           sudo mkdir -p vendor_tree/tee
           
-          # 3. Apply SET_METADATA logic natively to the filesystem
+          # 3. Apply Metadata to the TEE directory
           sudo chown 0:2000 vendor_tree/tee
           sudo chmod 755 vendor_tree/tee
           sudo apt-get install -y attr
           sudo setfattr -n security.selinux -v "u:object_r:tee_file:s0" vendor_tree/tee || sudo chcon u:object_r:tee_file:s0 vendor_tree/tee
 
-          # 4. Inject Payload Files
+          # 4. Remove Stock Recovery Overwrite Scripts (Explicit)
+          sudo find vendor_tree/ -type f -name "recovery-from-boot.p" -delete
+          sudo find vendor_tree/ -type f -name "*recovery*boot.p" -delete
+          sudo find vendor_tree/ -type f -name "install-recovery.sh" -delete
+
+          # 5. Inject Payload Files
           sudo cp -a patches/tee/vendor/tee_* vendor_tree/
           sudo cp patches/tee/vendor/etc/init/tee_blobs.rc vendor_tree/etc/init/
 
-          # 5. Conditional SELinux Policy Injection
+          # --- CRITICAL FIX: FORCE EXECUTION PERMISSIONS & SELINUX ---
+          # Make all injected TEE payloads root-owned and executable
+          sudo chown -R 0:0 vendor_tree/tee_*
+          sudo chmod -R 755 vendor_tree/tee_*
+          
+          # Fix the init script permissions (Must strictly be 644)
+          sudo chown 0:0 vendor_tree/etc/init/tee_blobs.rc
+          sudo chmod 644 vendor_tree/etc/init/tee_blobs.rc
+
+          # Apply SELinux contexts to the injected payloads
+          sudo setfattr -R -n security.selinux -v "u:object_r:vendor_file:s0" vendor_tree/tee_* 2>/dev/null || true
+          sudo setfattr -n security.selinux -v "u:object_r:vendor_configs_file:s0" vendor_tree/etc/init/tee_blobs.rc 2>/dev/null || true
+          # -----------------------------------------------------------
+
+          # 6. Conditional SELinux Policy Injection
           CIL_FILE="vendor_tree/etc/selinux/vendor_sepolicy.cil"
           if ! sudo grep -q "tee_file (dir (mounton" "$CIL_FILE"; then
               sudo bash -c "echo '(allow init_202404 tee_file (dir (mounton)))' >> $CIL_FILE"
               sudo bash -c "echo '(allow priv_app_202404 tee_file (dir (getattr)))' >> $CIL_FILE"
           fi
 
-          # 6. Dynamic Property Injection
+          # 7. Dynamic Property Injection
           PROP_FILE="vendor_tree/etc/build.prop"
           [ ! -f "$PROP_FILE" ] && PROP_FILE="vendor_tree/build.prop"
 
-          # Parse Supported Bootloaders
           BOOTLOADERS=$(cat patches/tee/supported_bootloaders | tr '\n' ',' | sed 's/,$//')
           sudo bash -c "echo 'ro.vendor.multitee.supported_bootloaders=$BOOTLOADERS' >> $PROP_FILE"
 
-          # Parse Version (Requires module.prop to be uploaded to your patches/tee/ directory)
           if [ -f "patches/tee/module.prop" ]; then
               VERSION=$(grep 'version=' patches/tee/module.prop | sed 's/version=//')
               sudo bash -c "echo 'ro.vendor.multitee.version=$VERSION' >> $PROP_FILE"
@@ -142,7 +159,6 @@ jobs:
               sudo bash -c "echo 'ro.vendor.multitee.version=v1.2.2' >> $PROP_FILE"
           fi
 
-          # Parse Git Revision
           REVISION=$(git rev-parse --short=8 HEAD)
           sudo bash -c "echo 'ro.vendor.multitee.revision=$REVISION' >> $PROP_FILE"
           
