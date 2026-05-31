@@ -57,9 +57,24 @@ jobs:
           MODEL="${{ github.event.inputs.model || 'SM-A346E' }}"
           REGION="${{ github.event.inputs.region || 'INS' }}"
           
-          # The Rust binary inherently bypasses IMEI requirements and decrypts on the fly
-          samloader download -m $MODEL -r $REGION -o decrypted_firmware.zip
-
+          # Wrap samloader in an automated 3-tier retry loop to absorb network drops
+          for i in {1..3}; do
+            echo "Attempt $i: Fetching firmware framework from Samsung servers..."
+            if samloader download -m $MODEL -r $REGION -o decrypted_firmware.zip; then
+              echo "SUCCESS: Full archive downloaded and decrypted cleanly."
+              break
+            fi
+            
+            echo "WARNING: Network connection dropped prematurely (UnexpectedEOF)."
+            if [ $i -lt 3 ]; then
+              echo "Waiting 20 seconds before attempting re-connection..."
+              sleep 20
+            else
+              echo "ERROR: Failed to maintain a stable download after 3 attempts. Exiting."
+              exit 1
+            fi
+          done
+          
       - name: Extract Images
         run: |
           # 1. Extract AP tarball and aggressively delete the 7GB firmware zip
