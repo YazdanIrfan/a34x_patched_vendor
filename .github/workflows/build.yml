@@ -62,14 +62,34 @@ jobs:
 
       - name: Extract Images
         run: |
+          # 1. Extract AP tarball and aggressively delete the 7GB firmware zip
           unzip -q decrypted_firmware.zip "AP_*.tar.md5"
+          rm decrypted_firmware.zip
+          
+          # 2. Extract super.img.lz4 and aggressively delete the 7GB AP tarball
           tar -xf AP_*.tar.md5 super.img.lz4
+          rm AP_*.tar.md5
+          
+          # 3. Decompress lz4 and aggressively delete the compressed archive
           lz4 -d super.img.lz4 super.img
+          rm super.img.lz4
+          
+          # 4. Convert sparse to raw using the C-binary (prevents Python RAM exhaustion)
+          if file super.img | grep -q "sparse"; then
+            simg2img super.img super_raw.img
+            rm super.img # Delete the 10.7GB sparse image immediately
+          else
+            mv super.img super_raw.img
+          fi
+          
+          # 5. Extract ONLY the vendor partition (ignores the massive 6GB system partition)
           mkdir extracted_super
+          python3 /usr/local/bin/lpunpack.py -p vendor super_raw.img extracted_super
           
-          # Execute the python lpunpack script
-          python3 /usr/local/bin/lpunpack.py super.img extracted_super
+          # 6. Aggressively delete the 16GB raw super image to clear space for repackaging
+          rm super_raw.img
           
+          # Handle vendor.img sparse formatting
           if file extracted_super/vendor.img | grep -q "sparse"; then
             simg2img extracted_super/vendor.img vendor_raw.img
           else
