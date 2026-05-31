@@ -1,0 +1,115 @@
+name: Build Patched Vendor
+
+on:
+  workflow_dispatch:
+    inputs:
+      model:
+        description: 'Device Model (e.g., SM-A346E)'
+        required: true
+        default: 'SM-A346E'
+      region:
+        description: 'Region/CSC (e.g., INS)'
+        required: true
+        default: 'INS'
+  schedule:
+    - cron: '0 0 * * 0' # Autonomous execution every Sunday at 00:00 UTC
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Maximize Build Space
+        uses: easimon/maximize-build-space@master
+        with:
+          remove-dotnet: 'true'
+          remove-android: 'true'
+          remove-haskell: 'true'
+          remove-codeql: 'true'
+          remove-docker-images: 'true'
+
+      - name: Install System Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-pip lz4 simg2img erofs-utils p7zip-full
+          pip3 install --user samloader3
+
+      - name: Install lpunpack
+        run: |
+          wget https://github.com/unix3dgforce/lpunpack/releases/latest/download/lpunpack
+          chmod +x lpunpack
+          sudo mv lpunpack /usr/local/bin/
+
+      - name: Retrieve and Decrypt Firmware
+        run: |
+          export PATH=$PATH:$HOME/.local/bin
+          # Handle cron triggers where inputs are not explicitly provided
+          MODEL="${{ github.event.inputs.model || 'SM-A346E' }}"
+          REGION="${{ github.event.inputs.region || 'INS' }}"
+          
+          VERSION=$(samloader3 checkupdate $MODEL $REGION)
+          echo "Firmware Version: $VERSION"
+          samloader3 download $MODEL $REGION $VERSION .
+          samloader3 decrypt $MODEL $REGION $VERSION *.enc4 *.zip
+
+      - name: Extract Images
+        run: |
+          unzip -q *.zip "AP_*.tar.md5"
+          tar -xf AP_*.tar.md5 super.img.lz4
+          lz4 -d super.img.lz4 super.img
+          mkdir extracted_super
+          lpunpack super.img extracted_super
+          
+          if file extracted_super/vendor.img | grep -q "sparse"; then
+            simg2img extracted_super/vendor.img vendor_raw.img
+          else
+            mv extracted_super/vendor.img vendor_raw.img
+          fi
+
+      - name: Patch Vendor Filesystem
+        run: |
+          mkdir vendor_mount vendor_tree
+          
+          # Mount EROFS (fallback to EXT4 if necessary)
+          sudo mount -t erofs vendor_raw.img vendor_mount || sudo mount -t ext4 vendor_raw.img vendor_mount
+          sudo cp -a vendor_mount/. vendor_tree/
+          sudo umount vendor_mount
+
+          # Apply Multi-TEE Patches
+          sudo rm -rf vendor_tree/tee
+          sudo cp -a patches/tee/vendor/tee_* vendor_tree/
+          sudo cp patches/tee/vendor/etc/init/tee_blobs.rc vendor_tree/etc/init/
+
+          # Inject Properties
+          sudo bash -c 'echo "ro.vendor.multitee.version=v1.2.2" >> vendor_tree/build.prop'
+          BOOTLOADERS=$(paste -sd, patches/tee/supported_bootloaders)
+          sudo bash -c "echo 'ro.vendor.multitee.supported_bootloaders=$BOOTLOADERS' >> vendor_tree/build.prop"
+
+          # Inject SELinux Policies (CRITICAL)
+          sudo bash -c 'echo "(allow init_202404 tee_file (dir (mounton)))" >> vendor_tree/etc/selinux/vendor_sepolicy.cil'
+          sudo bash -c 'echo "(allow priv_app_202404 tee_file (dir (getattr)))" >> vendor_tree/etc/selinux/vendor_sepolicy.cil'
+
+      - name: Rebuild Vendor Image (EROFS)
+        run: |
+          mkfs.erofs -zlz4hc vendor_patched.img vendor_tree/
+
+      - name: Generate Release Tag
+        id: tag
+        run: |
+          MODEL="${{ github.event.inputs.model || 'SM-A346E' }}"
+          REGION="${{ github.event.inputs.region || 'INS' }}"
+          echo "release_tag=${MODEL}_${REGION}_$(date +'%Y%m%d_%H%M%S')" >> $GITHUB_ENV
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.release_tag }}
+          name: "Patched Vendor: ${{ env.release_tag }}"
+          files: vendor_patched.img
+          draft: false
+          prerelease: false
