@@ -121,7 +121,7 @@ jobs:
 
       - name: Rebuild Vendor Image (EROFS)
         run: |
-          mkfs.erofs -zlz4hc vendor_patched.img vendor_tree/
+          sudo mkfs.erofs -zlz4hc vendor_patched.img vendor_tree/
 
       - name: Generate Release Tag
         id: tag
