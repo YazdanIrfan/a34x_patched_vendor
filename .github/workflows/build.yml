@@ -39,13 +39,12 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y python3-pip lz4 android-sdk-libsparse-utils erofs-utils p7zip-full
-          pip3 install --user git+https://github.com/nlscc/samloader.git
+          pip3 install --user --break-system-packages git+https://github.com/nlscc/samloader.git
 
       - name: Install lpunpack
         run: |
-          wget https://github.com/unix3dgforce/lpunpack/releases/latest/download/lpunpack
-          chmod +x lpunpack
-          sudo mv lpunpack /usr/local/bin/
+          wget https://raw.githubusercontent.com/unix3dgforce/lpunpack/master/lpunpack.py
+          sudo mv lpunpack.py /usr/local/bin/lpunpack.py
 
       - name: Retrieve and Decrypt Firmware
         run: |
@@ -59,20 +58,21 @@ jobs:
           # Download the encrypted firmware package
           samloader -m $MODEL -r $REGION download -v $VERSION -O .
           
-          # Identify the encrypted file and define the output zip name
-          ENC4_FILE=$(ls *.enc4 | head -n 1)
-          ZIP_FILE="${ENC4_FILE%.enc4}.zip"
+          # Identify the encrypted file and explicitly name the output zip
+          ENC_FILE=$(ls *.enc* | head -n 1)
           
-          # Decrypt the firmware
-          samloader -m $MODEL -r $REGION decrypt -v $VERSION -i $ENC4_FILE -o $ZIP_FILE
+          # Decrypt the firmware deterministically
+          samloader -m $MODEL -r $REGION decrypt -v $VERSION -i "$ENC_FILE" -o decrypted_firmware.zip
 
       - name: Extract Images
         run: |
-          unzip -q *.zip "AP_*.tar.md5"
+          unzip -q decrypted_firmware.zip "AP_*.tar.md5"
           tar -xf AP_*.tar.md5 super.img.lz4
           lz4 -d super.img.lz4 super.img
           mkdir extracted_super
-          lpunpack super.img extracted_super
+          
+          # Execute the python lpunpack script
+          python3 /usr/local/bin/lpunpack.py super.img extracted_super
           
           if file extracted_super/vendor.img | grep -q "sparse"; then
             simg2img extracted_super/vendor.img vendor_raw.img
@@ -94,12 +94,12 @@ jobs:
           sudo cp -a patches/tee/vendor/tee_* vendor_tree/
           sudo cp patches/tee/vendor/etc/init/tee_blobs.rc vendor_tree/etc/init/
 
-          # Inject Properties
-          sudo bash -c 'echo "ro.vendor.multitee.version=v1.2.2" >> vendor_tree/build.prop'
+          # Inject Properties (Targeting /etc/build.prop directly)
+          sudo bash -c 'echo "ro.vendor.multitee.version=v1.2.2" >> vendor_tree/etc/build.prop'
           BOOTLOADERS=$(paste -sd, patches/tee/supported_bootloaders)
-          sudo bash -c "echo 'ro.vendor.multitee.supported_bootloaders=$BOOTLOADERS' >> vendor_tree/build.prop"
+          sudo bash -c "echo 'ro.vendor.multitee.supported_bootloaders=$BOOTLOADERS' >> vendor_tree/etc/build.prop"
 
-          # Inject SELinux Policies (CRITICAL)
+          # Inject SELinux Policies
           sudo bash -c 'echo "(allow init_202404 tee_file (dir (mounton)))" >> vendor_tree/etc/selinux/vendor_sepolicy.cil'
           sudo bash -c 'echo "(allow priv_app_202404 tee_file (dir (getattr)))" >> vendor_tree/etc/selinux/vendor_sepolicy.cil'
 
