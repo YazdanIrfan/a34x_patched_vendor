@@ -100,25 +100,52 @@ jobs:
         run: |
           mkdir vendor_mount vendor_tree
           
-          # Mount EROFS (fallback to EXT4 if necessary)
+          # 1. Mount and Extract
           sudo mount -t erofs vendor_raw.img vendor_mount || sudo mount -t ext4 vendor_raw.img vendor_mount
           sudo cp -a vendor_mount/. vendor_tree/
           sudo umount vendor_mount
 
-          # Apply Multi-TEE Patches
+          # 2. Reset and Recreate TEE Mount Point (CRITICAL FIX)
           sudo rm -rf vendor_tree/tee
+          sudo mkdir -p vendor_tree/tee
+          
+          # 3. Apply SET_METADATA logic natively to the filesystem
+          sudo chown 0:2000 vendor_tree/tee
+          sudo chmod 755 vendor_tree/tee
+          sudo apt-get install -y attr
+          sudo setfattr -n security.selinux -v "u:object_r:tee_file:s0" vendor_tree/tee || sudo chcon u:object_r:tee_file:s0 vendor_tree/tee
+
+          # 4. Inject Payload Files
           sudo cp -a patches/tee/vendor/tee_* vendor_tree/
           sudo cp patches/tee/vendor/etc/init/tee_blobs.rc vendor_tree/etc/init/
 
-          # Inject Properties
-          sudo bash -c 'echo "ro.vendor.multitee.version=v1.2.2" >> vendor_tree/etc/build.prop'
-          BOOTLOADERS=$(paste -sd, patches/tee/supported_bootloaders)
-          sudo bash -c "echo 'ro.vendor.multitee.supported_bootloaders=$BOOTLOADERS' >> vendor_tree/etc/build.prop"
+          # 5. Conditional SELinux Policy Injection
+          CIL_FILE="vendor_tree/etc/selinux/vendor_sepolicy.cil"
+          if ! sudo grep -q "tee_file (dir (mounton" "$CIL_FILE"; then
+              sudo bash -c "echo '(allow init_202404 tee_file (dir (mounton)))' >> $CIL_FILE"
+              sudo bash -c "echo '(allow priv_app_202404 tee_file (dir (getattr)))' >> $CIL_FILE"
+          fi
 
-          # Inject SELinux Policies
-          sudo bash -c 'echo "(allow init_202404 tee_file (dir (mounton)))" >> vendor_tree/etc/selinux/vendor_sepolicy.cil'
-          sudo bash -c 'echo "(allow priv_app_202404 tee_file (dir (getattr)))" >> vendor_tree/etc/selinux/vendor_sepolicy.cil'
+          # 6. Dynamic Property Injection
+          PROP_FILE="vendor_tree/etc/build.prop"
+          [ ! -f "$PROP_FILE" ] && PROP_FILE="vendor_tree/build.prop"
 
+          # Parse Supported Bootloaders
+          BOOTLOADERS=$(cat patches/tee/supported_bootloaders | tr '\n' ',' | sed 's/,$//')
+          sudo bash -c "echo 'ro.vendor.multitee.supported_bootloaders=$BOOTLOADERS' >> $PROP_FILE"
+
+          # Parse Version (Requires module.prop to be uploaded to your patches/tee/ directory)
+          if [ -f "patches/tee/module.prop" ]; then
+              VERSION=$(grep 'version=' patches/tee/module.prop | sed 's/version=//')
+              sudo bash -c "echo 'ro.vendor.multitee.version=$VERSION' >> $PROP_FILE"
+          else
+              sudo bash -c "echo 'ro.vendor.multitee.version=v1.2.2' >> $PROP_FILE"
+          fi
+
+          # Parse Git Revision
+          REVISION=$(git rev-parse --short=8 HEAD)
+          sudo bash -c "echo 'ro.vendor.multitee.revision=$REVISION' >> $PROP_FILE"
+          
       - name: Rebuild Vendor Image (EROFS)
         run: |
           sudo mkfs.erofs -zlz4hc vendor_patched.img vendor_tree/
