@@ -39,7 +39,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y python3-pip lz4 android-sdk-libsparse-utils erofs-utils p7zip-full
-          pip3 install --user --break-system-packages git+https://github.com/nlscc/samloader.git
+          pip3 install --user --break-system-packages git+https://github.com/martinetd/samloader.git
 
       - name: Install lpunpack
         run: |
