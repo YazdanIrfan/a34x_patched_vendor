@@ -47,16 +47,21 @@ jobs:
           sudo mv lpunpack.py /usr/local/bin/lpunpack.py
 
       - name: Retrieve and Decrypt Firmware
+        env:
+          VALID_IMEI: ${{ secrets.IMEI }}
         run: |
           export PATH=$PATH:$HOME/.local/bin
           MODEL="${{ github.event.inputs.model || 'SM-A346E' }}"
           REGION="${{ github.event.inputs.region || 'INS' }}"
           
+          # Fallback to a synthetic IMEI if the secret is not configured
+          TARGET_IMEI="${VALID_IMEI:-351234567890123}"
+          
           VERSION=$(samloader -m $MODEL -r $REGION checkupdate)
           echo "Firmware Version: $VERSION"
           
-          # Download the encrypted firmware package
-          samloader -m $MODEL -r $REGION download -v $VERSION -O .
+          # Download the encrypted firmware package using the injected IMEI
+          samloader -m $MODEL -r $REGION -i $TARGET_IMEI download -v $VERSION -O .
           
           # Identify the encrypted file and explicitly name the output zip
           ENC_FILE=$(ls *.enc* | head -n 1)
