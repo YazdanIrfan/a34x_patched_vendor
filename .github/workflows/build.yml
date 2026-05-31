@@ -96,56 +96,59 @@ jobs:
             mv extracted_super/vendor.img vendor_raw.img
           fi
 
-      - name: Patch Vendor Filesystem
+      - name: Patch Vendor Filesystem (Multi-TEE Bind-Mount)
         run: |
           mkdir vendor_mount vendor_tree
           
-          # 1. Mount and Extract
+          # 1. Mount and Extract Stock Vendor
           sudo mount -t erofs vendor_raw.img vendor_mount || sudo mount -t ext4 vendor_raw.img vendor_mount
           sudo cp -a vendor_mount/. vendor_tree/
           sudo umount vendor_mount
 
-          # 2. Reset and Recreate TEE Mount Point
+          # 2. Recreate Base TEE Mount Point
           sudo rm -rf vendor_tree/tee
           sudo mkdir -p vendor_tree/tee
           
-          # 3. Apply Metadata to the TEE directory
+          # 3. Apply SELinux and Ownership to Base Mount Point
           sudo chown 0:2000 vendor_tree/tee
           sudo chmod 755 vendor_tree/tee
           sudo apt-get install -y attr
           sudo setfattr -n security.selinux -v "u:object_r:tee_file:s0" vendor_tree/tee || sudo chcon u:object_r:tee_file:s0 vendor_tree/tee
 
-          # 4. Remove Stock Recovery Overwrite Scripts (Explicit)
+          # 4. Remove Stock Recovery Scripts
           sudo find vendor_tree/ -type f -name "recovery-from-boot.p" -delete
           sudo find vendor_tree/ -type f -name "*recovery*boot.p" -delete
           sudo find vendor_tree/ -type f -name "install-recovery.sh" -delete
 
-          # 5. Inject Payload Files
+          # 5. Inject Fede2782's Multi-TEE Payloads
           sudo cp -a patches/tee/vendor/tee_* vendor_tree/
           sudo cp patches/tee/vendor/etc/init/tee_blobs.rc vendor_tree/etc/init/
 
-          # --- CRITICAL FIX: FORCE EXECUTION PERMISSIONS & SELINUX ---
-          # Make all injected TEE payloads root-owned and executable
+          # --- CRITICAL: BIND-MOUNT PERMISSIONS & SELINUX ---
+          # For the bind-mount to succeed, the older binaries MUST be root-owned and executable
           sudo chown -R 0:0 vendor_tree/tee_*
           sudo chmod -R 755 vendor_tree/tee_*
           
-          # Fix the init script permissions (Must strictly be 644)
+          # The init script that executes the bind-mount MUST strictly be 644
           sudo chown 0:0 vendor_tree/etc/init/tee_blobs.rc
           sudo chmod 644 vendor_tree/etc/init/tee_blobs.rc
 
-          # Apply SELinux contexts to the injected payloads
+          # Apply standard vendor contexts to the hidden TEE binaries so they can be mounted
           sudo setfattr -R -n security.selinux -v "u:object_r:vendor_file:s0" vendor_tree/tee_* 2>/dev/null || true
+          
+          # Label the RC script so Android's init daemon is allowed to read it
           sudo setfattr -n security.selinux -v "u:object_r:vendor_configs_file:s0" vendor_tree/etc/init/tee_blobs.rc 2>/dev/null || true
-          # -----------------------------------------------------------
+          # --------------------------------------------------
 
-          # 6. Conditional SELinux Policy Injection
+          # 6. Inject SELinux Bind-Mount Exceptions
+          # This grants init the security clearance to physically mount directories over the tee_file context
           CIL_FILE="vendor_tree/etc/selinux/vendor_sepolicy.cil"
           if ! sudo grep -q "tee_file (dir (mounton" "$CIL_FILE"; then
               sudo bash -c "echo '(allow init_202404 tee_file (dir (mounton)))' >> $CIL_FILE"
               sudo bash -c "echo '(allow priv_app_202404 tee_file (dir (getattr)))' >> $CIL_FILE"
           fi
 
-          # 7. Dynamic Property Injection
+          # 7. Inject Multi-TEE Properties (Required for tee_blobs.rc to verify bootloader)
           PROP_FILE="vendor_tree/etc/build.prop"
           [ ! -f "$PROP_FILE" ] && PROP_FILE="vendor_tree/build.prop"
 
@@ -156,11 +159,8 @@ jobs:
               VERSION=$(grep 'version=' patches/tee/module.prop | sed 's/version=//')
               sudo bash -c "echo 'ro.vendor.multitee.version=$VERSION' >> $PROP_FILE"
           else
-              sudo bash -c "echo 'ro.vendor.multitee.version=v1.2.2' >> $PROP_FILE"
+              sudo bash -c "echo 'ro.vendor.multitee.version=Fede2782-Port' >> $PROP_FILE"
           fi
-
-          REVISION=$(git rev-parse --short=8 HEAD)
-          sudo bash -c "echo 'ro.vendor.multitee.revision=$REVISION' >> $PROP_FILE"
           
       - name: Rebuild Vendor Image (EROFS)
         run: |
