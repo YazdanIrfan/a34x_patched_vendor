@@ -38,7 +38,7 @@ jobs:
       - name: Install System Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y python3-pip lz4 simg2img erofs-utils p7zip-full
+          sudo apt-get install -y python3-pip lz4 android-sdk-libsparse-utils erofs-utils p7zip-full
           pip3 install --user samloader3
 
       - name: Install lpunpack
