@@ -38,8 +38,14 @@ jobs:
       - name: Install System Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y python3-pip lz4 android-sdk-libsparse-utils erofs-utils p7zip-full
-          pip3 install --user --break-system-packages git+https://github.com/martinetd/samloader.git
+          sudo apt-get install -y lz4 android-sdk-libsparse-utils erofs-utils p7zip-full
+
+      - name: Install Rust Samloader
+        run: |
+          wget https://github.com/topjohnwu/samloader-rs/releases/latest/download/samloader-linux-x86_64.tar.xz
+          tar -xf samloader-linux-x86_64.tar.xz
+          sudo mv samloader /usr/local/bin/samloader
+          sudo chmod +x /usr/local/bin/samloader
 
       - name: Install lpunpack
         run: |
@@ -47,27 +53,12 @@ jobs:
           sudo mv lpunpack.py /usr/local/bin/lpunpack.py
 
       - name: Retrieve and Decrypt Firmware
-        env:
-          VALID_IMEI: ${{ secrets.IMEI }}
         run: |
-          export PATH=$PATH:$HOME/.local/bin
           MODEL="${{ github.event.inputs.model || 'SM-A346E' }}"
           REGION="${{ github.event.inputs.region || 'INS' }}"
           
-          # Fallback to a synthetic IMEI if the secret is not configured
-          TARGET_IMEI="${VALID_IMEI:-351234567890123}"
-          
-          VERSION=$(samloader -m $MODEL -r $REGION checkupdate)
-          echo "Firmware Version: $VERSION"
-          
-          # Download the encrypted firmware package using the injected IMEI
-          samloader -m $MODEL -r $REGION -i $TARGET_IMEI download -v $VERSION -O .
-          
-          # Identify the encrypted file and explicitly name the output zip
-          ENC_FILE=$(ls *.enc* | head -n 1)
-          
-          # Decrypt the firmware deterministically
-          samloader -m $MODEL -r $REGION decrypt -v $VERSION -i "$ENC_FILE" -o decrypted_firmware.zip
+          # The Rust binary inherently bypasses IMEI requirements and decrypts on the fly
+          samloader download -m $MODEL -r $REGION -o decrypted_firmware.zip
 
       - name: Extract Images
         run: |
@@ -99,7 +90,7 @@ jobs:
           sudo cp -a patches/tee/vendor/tee_* vendor_tree/
           sudo cp patches/tee/vendor/etc/init/tee_blobs.rc vendor_tree/etc/init/
 
-          # Inject Properties (Targeting /etc/build.prop directly)
+          # Inject Properties
           sudo bash -c 'echo "ro.vendor.multitee.version=v1.2.2" >> vendor_tree/etc/build.prop'
           BOOTLOADERS=$(paste -sd, patches/tee/supported_bootloaders)
           sudo bash -c "echo 'ro.vendor.multitee.supported_bootloaders=$BOOTLOADERS' >> vendor_tree/etc/build.prop"
