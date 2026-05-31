@@ -140,15 +140,22 @@ jobs:
           sudo setfattr -n security.selinux -v "u:object_r:vendor_configs_file:s0" vendor_tree/etc/init/tee_blobs.rc 2>/dev/null || true
           # --------------------------------------------------
 
-          # 6. Inject SELinux Bind-Mount Exceptions
-          # This grants init the security clearance to physically mount directories over the tee_file context
+          # 6. Inject SELinux Bind-Mount Exceptions (DYNAMIC CHANGED HERE)
+          # This automatically reads the firmware target's actual SELinux tags to prevent compiler panics
           CIL_FILE="vendor_tree/etc/selinux/vendor_sepolicy.cil"
-          if ! sudo grep -q "tee_file (dir (mounton" "$CIL_FILE"; then
-              sudo bash -c "echo '(allow init_202404 tee_file (dir (mounton)))' >> $CIL_FILE"
-              sudo bash -c "echo '(allow priv_app_202404 tee_file (dir (getattr)))' >> $CIL_FILE"
+          if [ -f "$CIL_FILE" ] && ! sudo grep -q "tee_file (dir (mounton" "$CIL_FILE"; then
+              INIT_TYPE=$(grep -oE '\(typeattributeset init_[a-zA-Z0-9_]*' "$CIL_FILE" | head -n 1 | awk '{print $2}')
+              PRIV_TYPE=$(grep -oE '\(typeattributeset priv_app_[a-zA-Z0-9_]*' "$CIL_FILE" | head -n 1 | awk '{print $2}')
+              
+              # Secure fallbacks if string patterns aren't matched
+              [ -z "$INIT_TYPE" ] && INIT_TYPE="init"
+              [ -z "$PRIV_TYPE" ] && PRIV_TYPE="priv_app"
+
+              sudo bash -c "echo '(allow $INIT_TYPE tee_file (dir (mounton)))' >> $CIL_FILE"
+              sudo bash -c "echo '(allow $PRIV_TYPE tee_file (dir (getattr)))' >> $CIL_FILE"
           fi
 
-          # 7. Inject Multi-TEE Properties (Required for tee_blobs.rc to verify bootloader)
+          # 7. Inject Multi-TEE Properties
           PROP_FILE="vendor_tree/etc/build.prop"
           [ ! -f "$PROP_FILE" ] && PROP_FILE="vendor_tree/build.prop"
 
