@@ -125,17 +125,14 @@ jobs:
           
           sudo mount -o ro vendor_raw.img vendor_mount
           
-          # 1. GENERATE BASE METADATA
-          echo "Generating fs_config and file_context maps..."
-          sudo find vendor_mount | sudo xargs -I "{}" -P "$(nproc)" stat -c "%n %u %g %a capabilities=0x0" "{}" > fs_config.txt
+          # 1. GENERATE BASE SELINUX METADATA
+          echo "Generating file_context map..."
           sudo find vendor_mount | sudo xargs -I "{}" -P "$(nproc)" sh -c 'echo "$1 $(getfattr -n security.selinux --only-values -h --absolute-names "$1" 2>/dev/null || echo "u:object_r:vendor_file:s0")"' sh "{}" > file_context.txt
           
-          # Copy files to writable tree
+          # Use archive copy (-a) to perfectly preserve all base ownership and permissions
           sudo cp -a -T vendor_mount/ vendor_tree/
           sudo umount vendor_mount
 
-          # Clean up metadata paths to match the ROM compiler format
-          sed -i 's|vendor_mount|vendor|g' fs_config.txt
           sed -i 's|vendor_mount|/vendor|g' file_context.txt
 
           # 2. INJECT TEE PAYLOADS
@@ -148,15 +145,30 @@ jobs:
           sudo find vendor_tree/ -type f -name "*recovery*boot.p" -delete
           sudo find vendor_tree/ -type f -name "install-recovery.sh" -delete
 
-          # 3. APPEND METADATA
-          cat patches/tee/fs_config-vendor >> fs_config.txt
+          # 3. APPEND FEDE'S SELINUX METADATA
           cat patches/tee/file_context-vendor >> file_context.txt
-          
-          # Sanitize duplicate or malformed lines from appending
-          sort -u -o fs_config.txt fs_config.txt
           sort -u -o file_context.txt file_context.txt
 
-          # 4. PATCH SELINUX CIL (Dynamic Injection)
+          # 4. MANUALLY APPLY UID/GID/MODE FROM FEDE'S FS_CONFIG
+          echo "Applying native permissions to TEE patches..."
+          while read -r col1 col2 col3 col4 col5; do
+              # Safely parse lines that might lack a path (e.g. root vendor)
+              if [[ "$col2" =~ ^[0-9]+$ ]]; then
+                  path="$col1"; uid="$col2"; gid="$col3"; mode="$col4"
+              else
+                  path=""; uid="$col1"; gid="$col2"; mode="$col3"
+              fi
+              
+              clean_path=$(echo "$path" | sed 's|^/vendor/||; s|^vendor/||; s|^vendor||')
+              target="vendor_tree/$clean_path"
+              
+              if [ -e "$target" ]; then
+                  sudo chown $uid:$gid "$target"
+                  sudo chmod $mode "$target"
+              fi
+          done < patches/tee/fs_config-vendor
+
+          # 5. PATCH SELINUX CIL (Dynamic Injection)
           CIL_FILE="vendor_tree/etc/selinux/vendor_sepolicy.cil"
           if [ -f "$CIL_FILE" ] && ! sudo grep -q "tee_file (dir (mounton" "$CIL_FILE"; then
               INIT_TYPE=$(grep -oE '\(typeattributeset init_[a-zA-Z0-9_]*' "$CIL_FILE" | head -n 1 | awk '{print $2}')
@@ -168,7 +180,7 @@ jobs:
               sudo bash -c "echo '(allow $PRIV_TYPE tee_file (dir (getattr)))' >> $CIL_FILE"
           fi
 
-          # 5. INJECT MULTI-TEE PROPS
+          # 6. INJECT MULTI-TEE PROPS
           PROP_FILE="vendor_tree/etc/build.prop"
           [ ! -f "$PROP_FILE" ] && PROP_FILE="vendor_tree/build.prop"
 
@@ -178,13 +190,13 @@ jobs:
           VERSION=$(grep 'version=' patches/tee/module.prop | sed 's/version=//' || echo "Fede2782-Port")
           sudo bash -c "echo 'ro.vendor.multitee.version=$VERSION' >> $PROP_FILE"
           
-          # 6. DISABLE FORCE ENCRYPTION (DFE)
+          # 7. DISABLE FORCE ENCRYPTION (DFE)
           sudo sed -i 's/fileencryption=[^,]*//g' vendor_tree/etc/fstab.* 2>/dev/null || true
           sudo sed -i 's/metadata_encryption=[^,]*//g' vendor_tree/etc/fstab.* 2>/dev/null || true
 
       - name: Rebuild Vendor Image (Strict EROFS Format)
         run: |
-          sudo mkfs.erofs -z "lz4hc,9" -b 4096 --mount-point "/vendor" --fs-config-file fs_config.txt --file-contexts file_context.txt vendor_patched.img vendor_tree/
+          sudo mkfs.erofs -z "lz4hc,9" -b 4096 --mount-point "/vendor" --file-contexts file_context.txt vendor_patched.img vendor_tree/
 
       - name: Generate Release Tag
         id: tag
