@@ -135,6 +135,9 @@ jobs:
 
           sed -i 's|vendor_mount|/vendor|g' file_context.txt
 
+          # SANITIZE REGEX CHARACTERS (Crucial for SELinux to parse brackets/dots in paths)
+          sed -i -e "s|\.|\\\.|g" -e "s|\+|\\\+|g" -e "s|\[|\\\[|g" -e "s|\]|\\\]|g" -e "s|\*|\\\*|g" file_context.txt
+
           # 2. INJECT TEE PAYLOADS
           sudo rm -rf vendor_tree/tee
           sudo mkdir -p vendor_tree/tee
@@ -152,7 +155,6 @@ jobs:
           # 4. MANUALLY APPLY UID/GID/MODE FROM FEDE'S FS_CONFIG
           echo "Applying native permissions to TEE patches..."
           while read -r col1 col2 col3 col4 col5; do
-              # Safely parse lines that might lack a path (e.g. root vendor)
               if [[ "$col2" =~ ^[0-9]+$ ]]; then
                   path="$col1"; uid="$col2"; gid="$col3"; mode="$col4"
               else
