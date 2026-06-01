@@ -22,12 +22,6 @@ jobs:
       - name: Checkout Main Repository
         uses: actions/checkout@v4
 
-      - name: Checkout TEE Patches
-        uses: actions/checkout@v4
-        with:
-          repository: YazdanIrfan/target_a34x_patches_tee
-          path: target_a34x_patches_tee
-
       - name: Free Maximum Disk Space
         uses: jlumbroso/free-disk-space@main
         with:
@@ -131,7 +125,7 @@ jobs:
           
           sudo mount -o ro vendor_raw.img vendor_mount
           
-          # 1. GENERATE BASE METADATA (Mimicking extract_fw.sh lines 112-113)
+          # 1. GENERATE BASE METADATA
           echo "Generating fs_config and file_context maps..."
           sudo find vendor_mount | sudo xargs -I "{}" -P "$(nproc)" stat -c "%n %u %g %a capabilities=0x0" "{}" > fs_config.txt
           sudo find vendor_mount | sudo xargs -I "{}" -P "$(nproc)" sh -c 'echo "$1 $(getfattr -n security.selinux --only-values -h --absolute-names "$1" 2>/dev/null || echo "u:object_r:vendor_file:s0")"' sh "{}" > file_context.txt
@@ -147,16 +141,16 @@ jobs:
           # 2. INJECT TEE PAYLOADS
           sudo rm -rf vendor_tree/tee
           sudo mkdir -p vendor_tree/tee
-          sudo cp -a target_a34x_patches_tee/vendor/tee_* vendor_tree/
-          sudo cp target_a34x_patches_tee/vendor/etc/init/tee_blobs.rc vendor_tree/etc/init/
+          sudo cp -a patches/tee/vendor/tee_* vendor_tree/
+          sudo cp patches/tee/vendor/etc/init/tee_blobs.rc vendor_tree/etc/init/
           
           sudo find vendor_tree/ -type f -name "recovery-from-boot.p" -delete
           sudo find vendor_tree/ -type f -name "*recovery*boot.p" -delete
           sudo find vendor_tree/ -type f -name "install-recovery.sh" -delete
 
-          # 3. APPEND FEDE'S METADATA
-          cat target_a34x_patches_tee/fs-condig_vendor >> fs_config.txt
-          cat target_a34x_patches_tee/file-context-vendor >> file_context.txt
+          # 3. APPEND METADATA
+          cat patches/tee/fs_config-vendor >> fs_config.txt
+          cat patches/tee/file_context-vendor >> file_context.txt
           
           # Sanitize duplicate or malformed lines from appending
           sort -u -o fs_config.txt fs_config.txt
@@ -178,10 +172,10 @@ jobs:
           PROP_FILE="vendor_tree/etc/build.prop"
           [ ! -f "$PROP_FILE" ] && PROP_FILE="vendor_tree/build.prop"
 
-          BOOTLOADERS=$(cat target_a34x_patches_tee/supported_bootloaders | tr '\n' ',' | sed 's/,$//')
+          BOOTLOADERS=$(cat patches/tee/supported_bootloaders | tr '\n' ',' | sed 's/,$//')
           sudo bash -c "echo 'ro.vendor.multitee.supported_bootloaders=$BOOTLOADERS' >> $PROP_FILE"
           
-          VERSION=$(grep 'version=' target_a34x_patches_tee/module.prop | sed 's/version=//' || echo "Fede2782-Port")
+          VERSION=$(grep 'version=' patches/tee/module.prop | sed 's/version=//' || echo "Fede2782-Port")
           sudo bash -c "echo 'ro.vendor.multitee.version=$VERSION' >> $PROP_FILE"
           
           # 6. DISABLE FORCE ENCRYPTION (DFE)
@@ -190,7 +184,6 @@ jobs:
 
       - name: Rebuild Vendor Image (Strict EROFS Format)
         run: |
-          # Mimicking build_fs_image.sh exactly (lz4hc compression, 4096 blocks, strict context feeding)
           sudo mkfs.erofs -z "lz4hc,9" -b 4096 --mount-point "/vendor" --fs-config-file fs_config.txt --file-contexts file_context.txt vendor_patched.img vendor_tree/
 
       - name: Generate Release Tag
