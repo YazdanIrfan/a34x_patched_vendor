@@ -1,4 +1,4 @@
-name: Build Patched Vendor (UN1CA Strict Compiler)
+name: Build Universal UN1CA ROM Stack
 
 on:
   workflow_dispatch:
@@ -40,12 +40,12 @@ jobs:
 
       - name: Install Rust Samloader & lpunpack
         run: |
-          wget https://github.com/topjohnwu/samloader-rs/releases/latest/download/samloader-linux-x86_64.tar.xz
+          wget -q https://github.com/topjohnwu/samloader-rs/releases/latest/download/samloader-linux-x86_64.tar.xz
           tar -xf samloader-linux-x86_64.tar.xz
           sudo mv samloader /usr/local/bin/samloader
           sudo chmod +x /usr/local/bin/samloader
           
-          wget https://raw.githubusercontent.com/unix3dgforce/lpunpack/master/lpunpack.py
+          wget -q https://raw.githubusercontent.com/unix3dgforce/lpunpack/master/lpunpack.py
           sudo mv lpunpack.py /usr/local/bin/lpunpack.py
 
       - name: Retrieve and Decrypt Firmware
@@ -53,6 +53,7 @@ jobs:
           MODEL="${{ github.event.inputs.model || 'SM-A346E' }}"
           REGION="${{ github.event.inputs.region || 'INS' }}"
           
+          echo "Fetching firmware from Samsung servers..."
           for i in {1..3}; do
             if samloader download -m $MODEL -r $REGION -o decrypted_firmware.zip; then
               break
@@ -60,18 +61,19 @@ jobs:
             sleep 20
           done
 
-      - name: Extract Images
+      - name: Extract Core Partitions & Super Image
         run: |
-          unzip -q decrypted_firmware.zip "AP_*.tar.md5"
+          unzip -q decrypted_firmware.zip "AP_*.tar.md5" "BL_*.tar.md5"
           rm decrypted_firmware.zip
           
-          tar -xf AP_*.tar.md5 super.img.lz4 init_boot.img.lz4 dtbo.img.lz4 vendor_boot.img.lz4 vbmeta.img.lz4 vbmeta_system.img.lz4 vbmeta_vendor.img.lz4 || true
-          rm AP_*.tar.md5
+          tar -xf AP_*.tar.md5 super.img.lz4 init_boot.img.lz4 dtbo.img.lz4 vendor_boot.img.lz4 boot.img.lz4 vbmeta_system.img.lz4 vbmeta_vendor.img.lz4 || true
+          tar -xf BL_*.tar.md5 vbmeta.img.lz4 || true
+          rm *.tar.md5
           
           lz4 -d super.img.lz4 super.img
           rm super.img.lz4
           
-          for img in init_boot dtbo vendor_boot vbmeta vbmeta_system vbmeta_vendor; do
+          for img in boot init_boot vendor_boot dtbo vbmeta vbmeta_system vbmeta_vendor; do
             if [ -f "${img}.img.lz4" ]; then
               lz4 -d "${img}.img.lz4" "${img}.img"
               rm "${img}.img.lz4"
@@ -84,15 +86,19 @@ jobs:
           else
             mv super.img super_raw.img
           fi
-          
+
+      - name: Unpack Logical Partitions (Vendor & DLKMs)
+        run: |
           mkdir extracted_super
           python3 /usr/local/bin/lpunpack.py -p vendor super_raw.img extracted_super
           python3 /usr/local/bin/lpunpack.py -p vendor_dlkm super_raw.img extracted_super
           python3 /usr/local/bin/lpunpack.py -p odm super_raw.img extracted_super
+          python3 /usr/local/bin/lpunpack.py -p system_dlkm super_raw.img extracted_super || true
+          python3 /usr/local/bin/lpunpack.py -p odm_dlkm super_raw.img extracted_super || true
           
           rm super_raw.img
           
-          for part in vendor vendor_dlkm odm; do
+          for part in vendor vendor_dlkm odm system_dlkm odm_dlkm; do
             if [ -f "extracted_super/${part}.img" ]; then
               if file "extracted_super/${part}.img" | grep -q "sparse"; then
                 simg2img "extracted_super/${part}.img" "${part}_raw.img"
@@ -104,6 +110,8 @@ jobs:
           
           [ -f vendor_dlkm_raw.img ] && mv vendor_dlkm_raw.img vendor_dlkm.img
           [ -f odm_raw.img ] && mv odm_raw.img odm.img
+          [ -f system_dlkm_raw.img ] && mv system_dlkm_raw.img system_dlkm.img
+          [ -f odm_dlkm_raw.img ] && mv odm_dlkm_raw.img odm_dlkm.img || true
 
       - name: Patch VBMeta (Disable AVB)
         run: |
@@ -119,40 +127,42 @@ jobs:
           
           [ -f vbmeta.img ] && tar -cvf vbmeta_disabled.tar vbmeta.img
 
-      - name: Extract Metadata & Merge UN1CA Patches
+      - name: Build Universal UN1CA Vendor (Permissions, SELinux & TEE)
         run: |
           mkdir vendor_mount vendor_tree
-          
           sudo mount -o ro vendor_raw.img vendor_mount
           
-          # 1. GENERATE BASE SELINUX METADATA
-          echo "Generating file_context map..."
+          echo "Generating base file_context map..."
           sudo find vendor_mount | sudo xargs -I "{}" -P "$(nproc)" sh -c 'echo "$1 $(getfattr -n security.selinux --only-values -h --absolute-names "$1" 2>/dev/null || echo "u:object_r:vendor_file:s0")"' sh "{}" > file_context.txt
           
-          # Use archive copy (-a) to perfectly preserve all base ownership and permissions
+          # Archive copy to preserve permissions
           sudo cp -a -T vendor_mount/ vendor_tree/
           sudo umount vendor_mount
 
+          # Standardize paths
           sed -i 's|vendor_mount|/vendor|g' file_context.txt
-
-          # SANITIZE REGEX CHARACTERS (Crucial for SELinux to parse brackets/dots in paths)
+          
+          # Sanitize regex strings to prevent compiler errors
           sed -i -e "s|\.|\\\.|g" -e "s|\+|\\\+|g" -e "s|\[|\\\[|g" -e "s|\]|\\\]|g" -e "s|\*|\\\*|g" file_context.txt
 
-          # 2. INJECT TEE PAYLOADS
+          echo "Merging Multi-TEE Packages..."
           sudo rm -rf vendor_tree/tee
           sudo mkdir -p vendor_tree/tee
+          
+          # Copy over all variants natively (chn, eea, kor, latam, sea, sea_august)
           sudo cp -a patches/tee/vendor/tee_* vendor_tree/
+          
+          # Use Fede's native universal tee_blobs.rc script
           sudo cp patches/tee/vendor/etc/init/tee_blobs.rc vendor_tree/etc/init/
           
           sudo find vendor_tree/ -type f -name "recovery-from-boot.p" -delete
           sudo find vendor_tree/ -type f -name "*recovery*boot.p" -delete
           sudo find vendor_tree/ -type f -name "install-recovery.sh" -delete
 
-          # 3. APPEND FEDE'S SELINUX METADATA
+          # Append Fede's context maps for all variants
           cat patches/tee/file_context-vendor >> file_context.txt
           sort -u -o file_context.txt file_context.txt
 
-          # 4. MANUALLY APPLY UID/GID/MODE FROM FEDE'S FS_CONFIG
           echo "Applying native permissions to TEE patches..."
           while read -r col1 col2 col3 col4 col5; do
               if [[ "$col2" =~ ^[0-9]+$ ]]; then
@@ -160,43 +170,38 @@ jobs:
               else
                   path=""; uid="$col1"; gid="$col2"; mode="$col3"
               fi
-              
               clean_path=$(echo "$path" | sed 's|^/vendor/||; s|^vendor/||; s|^vendor||')
               target="vendor_tree/$clean_path"
-              
               if [ -e "$target" ]; then
                   sudo chown $uid:$gid "$target"
                   sudo chmod $mode "$target"
               fi
           done < patches/tee/fs_config-vendor
 
-          # 5. PATCH SELINUX CIL (Dynamic Injection)
+          echo "Injecting SELinux CIL exceptions..."
           CIL_FILE="vendor_tree/etc/selinux/vendor_sepolicy.cil"
           if [ -f "$CIL_FILE" ] && ! sudo grep -q "tee_file (dir (mounton" "$CIL_FILE"; then
               INIT_TYPE=$(grep -oE '\(typeattributeset init_[a-zA-Z0-9_]*' "$CIL_FILE" | head -n 1 | awk '{print $2}')
               PRIV_TYPE=$(grep -oE '\(typeattributeset priv_app_[a-zA-Z0-9_]*' "$CIL_FILE" | head -n 1 | awk '{print $2}')
               [ -z "$INIT_TYPE" ] && INIT_TYPE="init"
               [ -z "$PRIV_TYPE" ] && PRIV_TYPE="priv_app"
-
               sudo bash -c "echo '(allow $INIT_TYPE tee_file (dir (mounton)))' >> $CIL_FILE"
               sudo bash -c "echo '(allow $PRIV_TYPE tee_file (dir (getattr)))' >> $CIL_FILE"
           fi
 
-          # 6. INJECT MULTI-TEE PROPS
+          echo "Setting Multi-TEE Props & DFE..."
           PROP_FILE="vendor_tree/etc/build.prop"
           [ ! -f "$PROP_FILE" ] && PROP_FILE="vendor_tree/build.prop"
-
           BOOTLOADERS=$(cat patches/tee/supported_bootloaders | tr '\n' ',' | sed 's/,$//')
           sudo bash -c "echo 'ro.vendor.multitee.supported_bootloaders=$BOOTLOADERS' >> $PROP_FILE"
-          
           VERSION=$(grep 'version=' patches/tee/module.prop | sed 's/version=//' || echo "Fede2782-Port")
           sudo bash -c "echo 'ro.vendor.multitee.version=$VERSION' >> $PROP_FILE"
           
-          # 7. DISABLE FORCE ENCRYPTION (DFE)
+          # Remove encryption flags
           sudo sed -i 's/fileencryption=[^,]*//g' vendor_tree/etc/fstab.* 2>/dev/null || true
           sudo sed -i 's/metadata_encryption=[^,]*//g' vendor_tree/etc/fstab.* 2>/dev/null || true
 
-      - name: Rebuild Vendor Image (Strict EROFS Format)
+      - name: Rebuild Vendor Image (Strict EROFS)
         run: |
           sudo mkfs.erofs -z "lz4hc,9" -b 4096 --mount-point "/vendor" --file-contexts file_context.txt vendor_patched.img vendor_tree/
 
@@ -205,17 +210,20 @@ jobs:
         run: |
           MODEL="${{ github.event.inputs.model || 'SM-A346E' }}"
           REGION="${{ github.event.inputs.region || 'INS' }}"
-          echo "release_tag=${MODEL}_${REGION}_UN1CA_COMPLIANT" >> $GITHUB_ENV
+          echo "release_tag=${MODEL}_${REGION}_UNIVERSAL_STACK" >> $GITHUB_ENV
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.release_tag }}
-          name: "Patched Vendor Pack: ${{ env.release_tag }}"
+          name: "Complete Flashable Universal Stack: ${{ env.release_tag }}"
           files: |
             vendor_patched.img
             vendor_dlkm.img
+            system_dlkm.img
             odm.img
+            odm_dlkm.img
+            boot.img
             init_boot.img
             vendor_boot.img
             dtbo.img
