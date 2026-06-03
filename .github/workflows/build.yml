@@ -1,22 +1,32 @@
-name: Build Universal UN1CA ROM Stack
+name: Build Isolated Multi-Variant ROM Stack
 
 on:
   workflow_dispatch:
-    inputs:
-      model:
-        description: 'Device Model (e.g., SM-A346E)'
-        required: true
-        default: 'SM-A346E'
-      region:
-        description: 'Region/CSC (e.g., INS)'
-        required: true
-        default: 'INS'
 
 jobs:
   build:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    strategy:
+      matrix:
+        include:
+          - model: 'SM-A346E'
+            region: 'INS'
+            tee_folder: 'tee_sea'
+          - model: 'SM-A346B'
+            region: 'EUX'
+            tee_folder: 'tee_eea'
+          - model: 'SM-A346M'
+            region: 'ZTO'
+            tee_folder: 'tee_latam'
+          - model: 'SM-A3460'
+            region: 'TGY'
+            tee_folder: 'tee_chn'
+          - model: 'SM-A346N'
+            region: 'KTC'
+            tee_folder: 'tee_kor'
+      fail-fast: false
 
     steps:
       - name: Checkout Main Repository
@@ -50,12 +60,9 @@ jobs:
 
       - name: Retrieve and Decrypt Firmware
         run: |
-          MODEL="${{ github.event.inputs.model || 'SM-A346E' }}"
-          REGION="${{ github.event.inputs.region || 'INS' }}"
-          
-          echo "Fetching firmware from Samsung servers..."
+          echo "Fetching targeted firmware for ${{ matrix.model }} (${{ matrix.region }})..."
           for i in {1..3}; do
-            if samloader download -m $MODEL -r $REGION -o decrypted_firmware.zip; then
+            if samloader download -m ${{ matrix.model }} -r ${{ matrix.region }} -o decrypted_firmware.zip; then
               break
             fi
             sleep 20
@@ -87,7 +94,7 @@ jobs:
             mv super.img super_raw.img
           fi
 
-      - name: Unpack Logical Partitions (Vendor & DLKMs)
+      - name: Unpack Logical Partitions
         run: |
           mkdir extracted_super
           python3 /usr/local/bin/lpunpack.py -p vendor super_raw.img extracted_super
@@ -125,9 +132,9 @@ jobs:
           EOF
           python3 patch_vbmeta.py vbmeta.img vbmeta_system.img vbmeta_vendor.img
           
-          [ -f vbmeta.img ] && tar -cvf vbmeta_disabled.tar vbmeta.img
+          [ -f vbmeta.img ] && tar -cvf vbmeta_disabled_${{ matrix.model }}.tar vbmeta.img
 
-      - name: Build Universal UN1CA Vendor (Permissions, SELinux & TEE)
+      - name: Build Isolated Model Patched Vendor Image
         run: |
           mkdir vendor_mount vendor_tree
           sudo mount -o ro vendor_raw.img vendor_mount
@@ -135,48 +142,43 @@ jobs:
           echo "Generating base file_context map..."
           sudo find vendor_mount | sudo xargs -I "{}" -P "$(nproc)" sh -c 'echo "$1 $(getfattr -n security.selinux --only-values -h --absolute-names "$1" 2>/dev/null || echo "u:object_r:vendor_file:s0")"' sh "{}" > file_context.txt
           
-          # Archive copy to preserve permissions
           sudo cp -a -T vendor_mount/ vendor_tree/
           sudo umount vendor_mount
 
-          # Standardize paths
           sed -i 's|vendor_mount|/vendor|g' file_context.txt
-          
-          # Sanitize regex strings to prevent compiler errors
           sed -i -e "s|\.|\\\.|g" -e "s|\+|\\\+|g" -e "s|\[|\\\[|g" -e "s|\]|\\\]|g" -e "s|\*|\\\*|g" file_context.txt
 
-          echo "Merging Multi-TEE Packages..."
+          echo "Cleaning pre-existing vendor TEE target configurations..."
           sudo rm -rf vendor_tree/tee
           sudo mkdir -p vendor_tree/tee
-          
-          # Copy over all variants natively (chn, eea, kor, latam, sea, sea_august)
-          sudo cp -a patches/tee/vendor/tee_* vendor_tree/
-          
-          # Use Fede's native universal tee_blobs.rc script
-          sudo cp patches/tee/vendor/etc/init/tee_blobs.rc vendor_tree/etc/init/
-          
+
+          echo "Size-Optimization: Injecting ONLY ${{ matrix.tee_folder }} into vendor tree..."
+          sudo mkdir -p "vendor_tree/${{ matrix.tee_folder }}"
+          sudo cp -a patches/tee/vendor/${{ matrix.tee_folder }}/* "vendor_tree/${{ matrix.tee_folder }}/"
+
+          echo "Generating single-variant hardware routing script..."
+          sudo mkdir -p vendor_tree/etc/init
+          cat << 'EOF' | sudo tee vendor_tree/etc/init/tee_blobs.rc
+          # Multi-TEE init.rc script - Stripped and optimized for ${{ matrix.model }}
+          # Unconditional execution based purely on physical device model string
+          on early-fs && property:ro.boot.em.model=${{ matrix.model }}
+              mount none /vendor/${{ matrix.tee_folder }} /vendor/tee bind
+          EOF
+
           sudo find vendor_tree/ -type f -name "recovery-from-boot.p" -delete
           sudo find vendor_tree/ -type f -name "*recovery*boot.p" -delete
           sudo find vendor_tree/ -type f -name "install-recovery.sh" -delete
 
-          # Append Fede's context maps for all variants
-          cat patches/tee/file_context-vendor >> file_context.txt
+          echo "Writing dynamic isolated SELinux policies..."
+          echo "/vendor/${{ matrix.tee_folder }}(/.*)? u:object_r:tee_file:s0" >> file_context.txt
+          echo "/vendor/etc/init/tee_blobs\.rc u:object_r:vendor_init_rc_file:s0" >> file_context.txt
           sort -u -o file_context.txt file_context.txt
 
-          echo "Applying native permissions to TEE patches..."
-          while read -r col1 col2 col3 col4 col5; do
-              if [[ "$col2" =~ ^[0-9]+$ ]]; then
-                  path="$col1"; uid="$col2"; gid="$col3"; mode="$col4"
-              else
-                  path=""; uid="$col1"; gid="$col2"; mode="$col3"
-              fi
-              clean_path=$(echo "$path" | sed 's|^/vendor/||; s|^vendor/||; s|^vendor||')
-              target="vendor_tree/$clean_path"
-              if [ -e "$target" ]; then
-                  sudo chown $uid:$gid "$target"
-                  sudo chmod $mode "$target"
-              fi
-          done < patches/tee/fs_config-vendor
+          echo "Applying native internal target permissions..."
+          sudo chmod 755 "vendor_tree/${{ matrix.tee_folder }}"
+          sudo find "vendor_tree/${{ matrix.tee_folder }}" -type d -exec sudo chmod 755 {} +
+          sudo find "vendor_tree/${{ matrix.tee_folder }}" -type f -exec sudo chmod 644 {} +
+          sudo chmod 644 vendor_tree/etc/init/tee_blobs.rc
 
           echo "Injecting SELinux CIL exceptions..."
           CIL_FILE="vendor_tree/etc/selinux/vendor_sepolicy.cil"
@@ -192,41 +194,41 @@ jobs:
           echo "Setting Multi-TEE Props & DFE..."
           PROP_FILE="vendor_tree/etc/build.prop"
           [ ! -f "$PROP_FILE" ] && PROP_FILE="vendor_tree/build.prop"
-          BOOTLOADERS=$(cat patches/tee/supported_bootloaders | tr '\n' ',' | sed 's/,$//')
-          sudo bash -c "echo 'ro.vendor.multitee.supported_bootloaders=$BOOTLOADERS' >> $PROP_FILE"
-          VERSION=$(grep 'version=' patches/tee/module.prop | sed 's/version=//' || echo "Fede2782-Port")
-          sudo bash -c "echo 'ro.vendor.multitee.version=$VERSION' >> $PROP_FILE"
+          sudo bash -c "echo 'ro.vendor.multitee.version=QuantumROM-Optimized-${{ matrix.model }}' >> $PROP_FILE"
           
-          # Remove encryption flags
           sudo sed -i 's/fileencryption=[^,]*//g' vendor_tree/etc/fstab.* 2>/dev/null || true
           sudo sed -i 's/metadata_encryption=[^,]*//g' vendor_tree/etc/fstab.* 2>/dev/null || true
 
-      - name: Rebuild Vendor Image (Strict EROFS)
+      - name: Rebuild Partition Images (Strict EROFS & Format)
         run: |
-          sudo mkfs.erofs -z "lz4hc,9" -b 4096 --mount-point "/vendor" --file-contexts file_context.txt vendor_patched.img vendor_tree/
+          sudo mkfs.erofs -z "lz4hc,9" -b 4096 --mount-point "/vendor" --file-contexts file_context.txt vendor_patched_${{ matrix.model }}.img vendor_tree/
 
-      - name: Generate Release Tag
-        id: tag
+      - name: Prepare Device-Specific Hardware Blobs
         run: |
-          MODEL="${{ github.event.inputs.model || 'SM-A346E' }}"
-          REGION="${{ github.event.inputs.region || 'INS' }}"
-          echo "release_tag=${MODEL}_${REGION}_UNIVERSAL_STACK" >> $GITHUB_ENV
+          mv boot.img boot_${{ matrix.model }}.img
+          mv init_boot.img init_boot_${{ matrix.model }}.img
+          mv vendor_boot.img vendor_boot_${{ matrix.model }}.img
+          mv dtbo.img dtbo_${{ matrix.model }}.img
+          mv vendor_dlkm.img vendor_dlkm_${{ matrix.model }}.img
+          mv system_dlkm.img system_dlkm_${{ matrix.model }}.img
+          mv odm.img odm_${{ matrix.model }}.img
+          [ -f odm_dlkm.img ] && mv odm_dlkm.img odm_dlkm_${{ matrix.model }}.img || touch odm_dlkm_${{ matrix.model }}.img
 
-      - name: Publish GitHub Release
+      - name: Publish to Unified GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ env.release_tag }}
-          name: "Complete Flashable Universal Stack: ${{ env.release_tag }}"
+          tag_name: "A34_ONEUI8_UNIVERSAL_STACK"
+          name: "Galaxy A34 One UI 8 Complete Hardware Components"
           files: |
-            vendor_patched.img
-            vendor_dlkm.img
-            system_dlkm.img
-            odm.img
-            odm_dlkm.img
-            boot.img
-            init_boot.img
-            vendor_boot.img
-            dtbo.img
-            vbmeta_disabled.tar
+            vendor_patched_${{ matrix.model }}.img
+            vendor_dlkm_${{ matrix.model }}.img
+            system_dlkm_${{ matrix.model }}.img
+            odm_${{ matrix.model }}.img
+            odm_dlkm_${{ matrix.model }}.img
+            boot_${{ matrix.model }}.img
+            init_boot_${{ matrix.model }}.img
+            vendor_boot_${{ matrix.model }}.img
+            dtbo_${{ matrix.model }}.img
+            vbmeta_disabled_${{ matrix.model }}.tar
           draft: false
-          prerelease: false
+          prerelease: true
